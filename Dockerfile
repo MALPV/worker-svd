@@ -27,6 +27,9 @@ RUN pip install --upgrade pip && pip install -r requirements-dev.txt
 # Copy the source code
 COPY ./src /src
 
+# Grant execution permissions to the start script
+RUN chmod +x /src/start.sh
+
 # Set the entrypoint
 CMD ["/src/start.sh"]
 
