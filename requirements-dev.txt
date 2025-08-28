@@ -7,4 +7,3 @@ Pillow
 requests
 imageio
 python-dotenv
-uploadthing
