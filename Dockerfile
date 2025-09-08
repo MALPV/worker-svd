@@ -66,10 +66,7 @@ RUN pip install --no-cache-dir \
     xformers==0.0.28.post2
 
 # Clone ComfyUI and custom nodes
-RUN git clone https://github.com/comfyanonymous/ComfyUI /ComfyUI && \
-    cd /ComfyUI && \
-    pip install -r requirements.txt && \
-    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
+RUN git clone https://github.com/comfyanonymous/ComfyUI /ComfyUI &&     cd /ComfyUI && git checkout v0.3.8 &&     pip install -r requirements.txt &&     git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
 
 # Download model files
 RUN mkdir -p /ComfyUI/models/checkpoints && \
