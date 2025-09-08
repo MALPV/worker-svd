@@ -1,32 +1,54 @@
-
 import os
 import runpod
 import torch
 import time
+import asyncio
+import execution
+import server
+from nodes import NODE_CLASS_MAPPINGS, load_custom_node
 import random
 import string
 import hashlib
 import mimetypes
 import requests
-import imageio
-import io
 from pathlib import Path
 from PIL import Image
-from diffusers import StableVideoDiffusionPipeline
-from diffusers.utils import load_image, export_to_video
+import io
 
-# --- Model Loading ---
-# This is done once when the worker starts.
-print("Loading model...")
-pipe = StableVideoDiffusionPipeline.from_pretrained(
-    "stabilityai/stable-video-diffusion-img2vid-xt",
-    torch_dtype=torch.float16,
-    variant="fp16"
-)
-pipe.to("cuda")
-print("Model loaded.")
+# Setup ComfyUI server
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+server_instance = server.PromptServer(loop)
+execution.PromptQueue(server)
 
-# --- Upload Function (from worker-mochi) ---
+# Load ComfyUI custom nodes
+# Assuming the custom nodes for SVD are in a similar location as mochi's
+# This might need adjustment based on the actual custom node structure for SVD
+# For now, I'll assume a placeholder name 'ComfyUI-SVD'
+load_custom_node("/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite")
+
+# Initialize ComfyUI nodes for the SVD pipeline
+# These are based on the ComfyUI SVD examples. The exact names might need verification.
+CheckpointLoaderSimple = NODE_CLASS_MAPPINGS["CheckpointLoaderSimple"]()
+VAELoader = NODE_CLASS_MAPPINGS["VAELoader"]()
+LoadImage = NODE_CLASS_MAPPINGS["LoadImage"]()
+SVD_img2vid_Conditioning = NODE_CLASS_MAPPINGS["SVD_img2vid_Conditioning"]()
+VideoLinearCFGGuidance = NODE_CLASS_MAPPINGS["VideoLinearCFGGuidance"]()
+KSampler = NODE_CLASS_MAPPINGS["KSampler"]()
+VAEDecode = NODE_CLASS_MAPPINGS["VAEDecode"]()
+VHS_VideoCombine = NODE_CLASS_MAPPINGS["VHS_VideoCombine"]()
+
+
+# Load models at startup
+with torch.inference_mode():
+    # Load SVD model
+    svd_model, _, _ = CheckpointLoaderSimple.load_checkpoint(
+        "svd_xt.safetensors"
+    )
+    # Load VAE
+    vae = VAELoader.load_vae("vae-ft-mse-840000-ema-pruned.safetensors")[0]
+
+
 def upload_file_to_uploadthing(
     file_path: str | Path,
     max_retries: int = 2,
@@ -98,10 +120,9 @@ def upload_file_to_uploadthing(
     raise last_error
 
 
-# --- Main Handler ---
 @torch.inference_mode()
-def generate(job):
-    values = job["input"]
+def generate(input):
+    values = input["input"]
     video_path = None
     try:
         # 1. Get parameters
@@ -116,35 +137,73 @@ def generate(job):
         motion_bucket_id = values.get("motion_bucket_id", 127)
         noise_aug_strength = values.get("noise_aug_strength", 0.02)
         seed = values.get("seed", int(time.time()))
+        steps = values.get("steps", 30)
+        cfg = values.get("cfg", 2.5)
 
         # 2. Download and prepare image
         print("Downloading image...")
         response = requests.get(image_url)
         response.raise_for_status()
         image = Image.open(io.BytesIO(response.content))
-        image = image.resize((width, height))
+        
+        # Save image temporarily to be loaded by LoadImage node
+        temp_image_path = f"/tmp/input_image.png"
+        image.save(temp_image_path)
+        
+        # 3. Load image using ComfyUI node
+        loaded_image, _ = LoadImage.load_image(temp_image_path)
 
-        # 3. Set seed
-        generator = torch.manual_seed(seed)
+        # 4. SVD pipeline
+        positive, negative = SVD_img2vid_Conditioning.encode(
+            svd_model,
+            loaded_image,
+            noise_aug_strength,
+            motion_bucket_id,
+            0, # video_angle - not used in the example
+            0, # video_flip - not used in the example
+            width,
+            height,
+            num_frames,
+            1, # batch_size
+        )
 
-        # 4. Generate video frames
-        print("Generating video frames...")
-        frames = pipe(
-            image,
-            decode_chunk_size=8,
-            generator=generator,
-            motion_bucket_id=motion_bucket_id,
-            noise_aug_strength=noise_aug_strength,
-            num_frames=num_frames,
-        ).frames[0]
+        # This node seems to be a custom one, let's assume it's available
+        # If not, we might need to implement the logic or find an alternative
+        model = VideoLinearCFGGuidance.patch(svd_model, 1.0)[0]
 
-        # 5. Save frames as video file
-        print("Combining frames into video...")
-        video_path = Path("/tmp/output.mp4")
-        imageio.mimsave(video_path, frames, fps=fps)
+        latent = KSampler.sample(
+            model,
+            seed,
+            steps,
+            cfg,
+            "euler", # sampler_name
+            "normal", # scheduler
+            positive,
+            negative,
+            1, # latent_image
+            denoise=1.0,
+        )[0]
+
+        frames = VAEDecode.decode(vae, latent)[0]
+
+        # 5. Combine frames into video
+        print("Combining frames into video.")
+        out_video = VHS_VideoCombine.combine_video(
+            images=frames,
+            frame_rate=fps,
+            loop_count=0,
+            filename_prefix="SVD",
+            format="video/h264-mp4",
+            save_output=True,
+            pix_fmt="yuv420p",
+            crf=17,
+        )
 
         # 6. Upload video
-        print("Uploading video...")
+        print("Uploading video.")
+        _, output_files = out_video["result"][0]
+        video_path = output_files[-1]
+
         presigned_response, _, _ = upload_file_to_uploadthing(video_path)
         video_url = presigned_response.json()['data'][0]['fileUrl']
 
@@ -161,13 +220,13 @@ def generate(job):
             "result": None
         }
     finally:
-        # 7. Clean up temporary file
+        # 7. Clean up temporary files
         if video_path and os.path.exists(video_path):
             os.remove(video_path)
             print(f"Cleaned up temporary file: {video_path}")
+        if os.path.exists("/tmp/input_image.png"):
+            os.remove("/tmp/input_image.png")
 
 
-# --- Start Server ---
 if __name__ == "__main__":
-    print("Starting RunPod serverless worker...")
     runpod.serverless.start({"handler": generate})
